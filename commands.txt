@@ -1,0 +1,8 @@
+tsp0 python test_neuroformer.py --stim drifting_gratings -o neuroformer
+tsp0 python test_neuroformer.py --stim drifting_gratings -o neuroformer_neg -n
+tsp1 python test_neuroformer.py --stim static_gratings -o neuroformer
+tsp1 python test_neuroformer.py --stim static_gratings -o neuroformer_neg -n
+tsp2 python test_neuroformer.py --stim natural_scenes -o neuroformer
+tsp2 python test_neuroformer.py --stim natural_scenes -o neuroformer_neg -n
+tsp3 python test_neuroformer.py --stim locally_sparse_noise -o neuroformer
+tsp3 python test_neuroformer.py --stim locally_sparse_noise -o neuroformer_neg -n

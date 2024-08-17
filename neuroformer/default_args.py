@@ -33,6 +33,8 @@ def parse_args():
     parser.add_argument("--finetune", action="store_true", default=False, help="Finetune")
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--n_epochs", type=int, default=250, help="Number of epochs")
+    parser.add_argument("--container_id", type=str, default="511510718", help="Container ID")
+    parser.add_argument("--stim", type=str, default="natural_scenes", help="Stimulus type")
     return parser.parse_args()
 
 class DefaultArgs:

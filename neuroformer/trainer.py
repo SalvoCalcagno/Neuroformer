@@ -150,7 +150,7 @@ class Trainer:
         mconf = self.mconf
         tconf = object_to_dict(self.config)
         # dconf = object_to_dict(self.train_dataset)
-        print(mconf)
+        #print(mconf)
 
         # save_yaml(mconf, os.path.join(self.config.ckpt_path, "mconf.yaml"))
         # save yaml
@@ -225,11 +225,25 @@ class Trainer:
             scores = collections.defaultdict(list)
             losses = collections.defaultdict(list)
             pbar = tqdm(enumerate(loader), total=len(loader), disable=self.config.no_pbar) if is_train else enumerate(loader)
-            for it, (x, y) in pbar:
-
+            for it, batch in pbar:
+                
+                if model.config.allen:
+                    x = {
+                        'id_prev': batch['src'],
+                        'id': torch.cat((batch['src'][:, :, -1:], batch['tgt'][:, :, :-1]), dim=2),
+                        'frames': batch['stim'],
+                        'pad': None,
+                    }
+                    y = batch['tgt']
+                else:
+                    x, y = batch
+                
                 # place data on the correct device
                 x = all_device(x, self.device)
                 y = all_device(y, self.device)
+                
+                if model.config.allen:
+                    x['pad'] = None
 
                 # forward the model
                 with torch.set_grad_enabled(is_train):
@@ -260,38 +274,46 @@ class Trainer:
 
                     lr = optimizer.param_groups[0]['lr']
                     # report progress
-                    precision = preds['precision']
-                    # pbar.set_description(f"epoch {epoch+1} iter {it}: frame_loss: {loss['frames'].item():.5f} id_loss {loss['id'].item():.5f} dt_loss: {loss['dt'].item():.5f}   total_loss: {total_loss.item():.5f}. lr {lr:e}")
-                    pbar.set_description(f'epoch {epoch+1}  ' + ''.join([f'{str(key)}_{str(split)}: {value:.5f}  ' for key, value in loss.items()]) + \
-                                         f'total_loss: {total_loss.mean():.5f}' + f' lr {lr:e}' + ' ' + f'precision: {precision.mean():.5f}')
-            
-                    #  linear warmup
-                    lr_mult = 1
-                    self.tokens += (y['id']>=0).sum() # number of tokens processed this step (i.e label is not -100)
-                    if self.tokens < config.warmup_tokens:
-                        # linear warmup
-                        lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
-                    else:
-                        if config.lr_decay:
-                            # cosine learning rate decay
-                            progress = float(self.tokens - config.warmup_tokens) / float(max(1, config.final_tokens - config.warmup_tokens))
-                            lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
-                    lr = config.learning_rate * lr_mult
-                    for param_group in optimizer.param_groups:
-                        param_group['lr'] = lr
+                    if not model.config.allen:
+                        precision = preds['precision']
+                        # pbar.set_description(f"epoch {epoch+1} iter {it}: frame_loss: {loss['frames'].item():.5f} id_loss {loss['id'].item():.5f} dt_loss: {loss['dt'].item():.5f}   total_loss: {total_loss.item():.5f}. lr {lr:e}")
+                        pbar.set_description(f'epoch {epoch+1}  ' + ''.join([f'{str(key)}_{str(split)}: {value:.5f}  ' for key, value in loss.items()]) + \
+                                            f'total_loss: {total_loss.mean():.5f}' + f' lr {lr:e}' + ' ' + f'precision: {precision.mean():.5f}')
+                        #  linear warmup
+                        lr_mult = 1
+                        self.tokens += (y['id']>=0).sum() # number of tokens processed this step (i.e label is not -100)
+                        if self.tokens < config.warmup_tokens:
+                            # linear warmup
+                            lr_mult = float(self.tokens) / float(max(1, config.warmup_tokens))
+                        else:
+                            if config.lr_decay:
+                                # cosine learning rate decay
+                                progress = float(self.tokens - config.warmup_tokens) / float(max(1, config.final_tokens - config.warmup_tokens))
+                                lr_mult = max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))
+                        lr = config.learning_rate * lr_mult
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = lr
+                   
 
-                    # Wandb logging if specified
-                    if config.use_wandb:
-                        for loss_name, loss_value in loss.items():
-                            wandb.log({f"Loss/{split}_{str(loss_name)}": loss_value})
+                        # Wandb logging if specified
+                        if config.use_wandb:
+                            for loss_name, loss_value in loss.items():
+                                wandb.log({f"Loss/{split}_{str(loss_name)}": loss_value})
+                            for score in config.score_metrics:
+                                wandb.log({f"Score/{split}_{str(score)}": preds[score].mean()})
+                                    
                         for score in config.score_metrics:
-                            wandb.log({f"Score/{split}_{str(score)}": preds[score].mean()})
+                            scores[score].append(preds[score])    
+                    else:
+                        pbar.set_description(f'epoch {epoch+1}  ' + ''.join([f'{str(key)}_{str(split)}: {value:.5f}  ' for key, value in loss.items()]) + \
+                                            f'total_loss: {total_loss.mean():.5f}' + f' lr {lr:e}')
+                        if config.use_wandb:
+                            for loss_name, loss_value in loss.items():
+                                wandb.log({f"Loss/{split}_{str(loss_name)}": loss_value})
+                        config.score_metrics = []
                 
                 # if it % 100 == 0:
                 #     self.save_checkpoint(it, np.array(scores['F1']).mean())
-
-                for score in config.score_metrics:
-                    scores[score].append(preds[score])
 
                 if config.save_every > 0 and it % config.save_every == 0 and it > 0:
                     self.save_checkpoint(total_loss.cpu().detach().numpy(), it)

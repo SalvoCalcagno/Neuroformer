@@ -30,12 +30,12 @@ from einops.layers.torch import Rearrange
 import timm
 import omegaconf
 
-from modules import (PositionalEmbedding, PositionalEncoding2D, 
+from neuroformer.modules import (PositionalEmbedding, PositionalEncoding2D, 
                      PositionalEncodingPermute2D, PositionalEncoding3D,
                      TemporalEmbedding, LearntTemporalEmbedding,
                      contrastive_loss, clip_loss, topk_metrics, separate_eos_tokens)
 import collections
-from utils import get_attr, object_to_dict, load_config
+from neuroformer.utils import get_attr, object_to_dict, load_config
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,12 @@ class VideoEncoder(nn.Module):
             )
 
     def forward(self, x):
+        
+        ndim = x.ndim
+        
+        if ndim > 5:
+            x = x.squeeze(1)
+            
         if self.conv_layer:
             x = self.conv_block(x)
         else:
@@ -934,6 +940,13 @@ class Neuroformer(nn.Module):
         self.tokenizer = tokenizer
         self.id_vocab_size = tokenizer.ID_vocab_size
         self.dt_vocab_size = tokenizer.dt_vocab_size
+        
+        if config.allen:
+            self.linear_projection = nn.Linear(tokenizer.ID_vocab_size - 3, config.n_embd)
+            self.linear_decoder = nn.Linear(config.n_embd, tokenizer.ID_vocab_size - 3)
+            self.sos = nn.Embedding(1, config.n_embd)
+            self.eos = nn.Embedding(1, config.n_embd)
+            self.pad = nn.Embedding(1, config.n_embd)
 
         # -- Input Embedding Stem -- #        self.n_embd = config.n_embd
         self.tok_emb = nn.Embedding(self.id_vocab_size, config.n_embd)
@@ -1137,6 +1150,79 @@ class Neuroformer(nn.Module):
         return features
 
     def process_features(self, x):
+        
+        if self.config.allen:
+            #src_embed = self.linear_projection(x['id_prev'].transpose(1, 2))
+            #tgt_embed = self.linear_projection(x['id'].transpose(1, 2))
+                            
+            # batch, block_size, feature
+            p_idx = x['id_prev'].transpose(1, 2)
+            idx = x['id'].transpose(1, 2)
+            
+            #dtx = x['dt']
+            #dtx_prev = x['dt_prev']
+            if hasattr(self, 'video_encoder'):
+                frames = self.video_encoder(x['frames']) if 'frames' in x else None
+                x['frames'] = x['frames'].squeeze()
+            else:
+                frames = None
+            
+            pad = x['pad']
+            
+            features = dict()
+
+            # forward the Neuroformer model
+            ''' 
+            positional and temporal embeddings implemented in multiple ways, learnt, 
+            fourrier decomposition and in the case of time, just passed as is. 
+            '''
+            # Embeddings
+            prev_id_position_embeddings = self.pos_emb_prev if self.config.pos_emb else 0
+            #prev_id_temporal_embeddings = self.temp_emb_prev(dtx_prev.float()) if self.config.temp_emb else 0
+            id_position_embeddings = self.pos_emb if self.config.pos_emb else 0
+            #id_temporal_embeddings = self.temp_emb(dtx.float()) if self.config.temp_emb else 0
+            # frame_position_embeddings = self.pos_emb_frames.repeat(1, self.n_frames, 1)
+            # frame_temporal_embeddings = self.temp_emb_frames(self.frame_temp_emb_seq)
+            
+            # Extract ID features
+            prev_token_embeddings = self.linear_projection(p_idx)
+            prev_token_embeddings = self.id_drop(prev_token_embeddings + prev_id_position_embeddings[:, :p_idx.size(1)]) # each index maps to a (learnable) vector
+            
+            token_embeddings = self.linear_projection(idx)
+            # Replace idx[:, 0] with SOS token
+            dev = token_embeddings.device
+            token_embeddings[:, 0] = self.sos(torch.zeros(1).long().to(dev))
+            # append also [EOS] token
+            #token_embeddings = torch.cat([token_embeddings, self.eos(torch.zeros(1).long().to(dev))], dim=1)
+            token_embeddings = self.id_drop(token_embeddings + id_position_embeddings[:, :idx.size(1)]) # each index maps to a (learnable) vector
+
+            # Extract image features and add time embeddings
+            if 'frames' in x and frames != None:
+                frame_embeddings = frames    # self.tok_emb(frames)
+                im_3d_embeddings = self.frame_3d_emb(frames)
+                frame_embeddings = frames + im_3d_embeddings
+                frame_embeddings = rearrange(frames, 'b t h w e -> b (t h w) e')
+                frame_sos = token_embeddings[:, 0].unsqueeze(1)
+                frame_embeddings = torch.cat([frame_sos, frame_embeddings], dim=1)
+                # frame_embeddings = frame_embeddings + frame_position_embeddings + frame_temporal_embeddings
+                frame_embeddings = self.im_drop(frame_embeddings)   # separate pos emb?
+            else:
+                frame_embeddings = None
+            
+            features = self.feature_encoder(token_embeddings, frame_embeddings)
+            token_embeddings = features['id']
+            frame_embeddings = features['frames'] if 'frames' != None else 0
+            #if self.modalities_config is not None:
+            #    features = self.process_all_modalities(x)
+            
+            # Tidy up
+            features['id_prev'] = prev_token_embeddings
+            features['id'] = token_embeddings
+            features['frames'] = frame_embeddings
+            features['raw_frames'] = frames
+            
+            return features, pad
+        
         # batch, block_size, feature
         p_idx = x['id_prev']
         idx = x['id']
@@ -1199,11 +1285,20 @@ class Neuroformer(nn.Module):
         return logits
 
     def forward(self, x, targets=None):
+        
         idx = x['id']
         pad = x['pad']
-        B, t = idx.size()
+        if self.config.allen:
+            B, _, t = idx.size()
+            ndim = x['frames'].dim()
+            x['frames'] = x['frames'].unsqueeze(1)
+            if ndim == 3:
+                x['frames'] = x['frames'].unsqueeze(1)
+        else:
+            B, t = idx.size()
         
         features, pad = self.process_features(x)
+        
         if get_attr(self.config, 'mlp_only', False):
             x = features['id']
         elif get_attr(self.config, 'gru_only', False):
@@ -1212,8 +1307,12 @@ class Neuroformer(nn.Module):
             x, _ = self.gru(features['id'], features['id_prev'])
         else:
             x = self.neural_visual_transformer(features)
-        id_logits = self.head_id(x)
-        dt_logits = self.head_dt(x)    # (B, T_id, 1)
+        
+        if self.config.allen:
+            id_logits = self.linear_decoder(x).transpose(1, 2)
+        else:
+            id_logits = self.head_id(x)
+            dt_logits = self.head_dt(x)    # (B, T_id, 1)
         if get_attr(self.config, 'predict_behavior', False):
             behavior_logits = self.predict_var(x)
 
@@ -1234,17 +1333,19 @@ class Neuroformer(nn.Module):
             loss = collections.defaultdict(float)
             n = float('inf') if not self.config.contrastive else 4
 
-            
-            ## separate ids and dts into the neural data and eos tokens
-            eos_id_tok = self.tokenizer.stoi['ID']['EOS']
-            eos_dt_tok = self.tokenizer.stoi['dt']['EOS']
-            eos_id_logits, eos_dt_logits, \
-            id_logits_no_eos, dt_logits_no_eos, \
-            targets = separate_eos_tokens(eos_id_tok, eos_dt_tok, 
-                                          targets, id_logits, 
-                                          dt_logits)
+            if not self.config.allen:
+                ## separate ids and dts into the neural data and eos tokens
+                eos_id_tok = self.tokenizer.stoi['ID']['EOS']
+                eos_dt_tok = self.tokenizer.stoi['dt']['EOS']
+                eos_id_logits, eos_dt_logits, \
+                id_logits_no_eos, dt_logits_no_eos, \
+                targets = separate_eos_tokens(eos_id_tok, eos_dt_tok, 
+                                            targets, id_logits, 
+                                            dt_logits)
 
-            if self.config.class_weights != None:
+            if self.config.allen:
+                loss_id = F.mse_loss(id_logits, targets)
+            elif self.config.class_weights != None:
                 loss_id = F.cross_entropy(id_logits.view(-1, id_logits.size(-1)), targets['id'].view(-1),
                                           ignore_index=self.config.ignore_index_id, weight=self.class_weights_id)
                 loss_time = F.cross_entropy(dt_logits.view(-1, dt_logits.size(-1)), targets['dt'].view(-1), 
@@ -1261,7 +1362,8 @@ class Neuroformer(nn.Module):
             # TODO: fix the ambiguity with block_type / modality
             # iterate over modalities required for prediction
             x_mean = x.mean(dim=1)
-            if 'modalities'in targets.keys():
+            mod = False if self.config.allen else 'modalities' in targets.keys()
+            if mod:
                 for modality_type, modality_config in self.modalities_config.items():
                     for variable_name, variable_config in modality_config['variables'].items():
                         if variable_config.get('predict', False) and variable_name in targets['modalities'][modality_type]:
@@ -1277,9 +1379,12 @@ class Neuroformer(nn.Module):
             
             if self.config.contrastive.contrastive:
                 clip_id_feats = []
-                for B, P in enumerate(pad):
-                    clip_id_feats.append(features['id'][B, t - P])
-                clip_id_feats = torch.stack(clip_id_feats)
+                if self.config.allen:
+                    clip_id_feats = features['id'][:, -1]
+                else:
+                    for B, P in enumerate(pad):
+                        clip_id_feats.append(features['id'][B, t - P])
+                    clip_id_feats = torch.stack(clip_id_feats)
                 # n = 2
                 # loss['clip'] = self.clip(features['frames'][:, 0], features['id'][:, -1]) * (1 / n) 
                 # loss['clip'] = self.clip(features['frames'][:, 0], clip_id_feats) * (1 / n)
@@ -1311,9 +1416,16 @@ class Neuroformer(nn.Module):
                 loss['clip'], features['clip'] = self.clip(feats_clip)
                 loss['clip'] = loss['clip'] * (1 / n)
             
-            loss['id'] = ((3 / 5) * loss_id) * (1 - 1 / n)   # sum(loss_id) / (b * 2)   # / len(loss_id)
-            loss['time'] = ((2 / 5) * loss_time) * (1 - 1 / n)
+            if not self.config.allen:
+                loss['id'] = ((3 / 5) * loss_id) * (1 - 1 / n)   # sum(loss_id) / (b * 2)   # / len(loss_id)
+                loss['time'] = ((2 / 5) * loss_time) * (1 - 1 / n)
+            else:
+                loss['id'] = loss_id * (1 - 1 / n)
 
+            if self.config.allen:
+                preds = id_logits
+                return preds, features, loss
+            
             t = targets['id'].size(1)
             for B, P in enumerate(pad):                
                 id_targets = targets['id'][B, :t - P - 1] # don't include EOS.
@@ -1343,6 +1455,9 @@ class Neuroformer(nn.Module):
             else:
                 preds['probs_id'] = torch.zeros(1).to(self.device)
         else:
+            if self.config.allen:
+                return id_logits, None, None
+            
             zero_tensor = torch.zeros(1).to(self.device)
             precision.append(zero_tensor)
             recall.append(zero_tensor)
@@ -1363,3 +1478,4 @@ class Neuroformer(nn.Module):
         features['last_layer'] = x
 
         return preds, features, loss
+    

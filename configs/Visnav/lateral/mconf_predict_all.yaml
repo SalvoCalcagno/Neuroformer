@@ -33,9 +33,9 @@ sparse:
 
 window:
   frame: 0.15
-  curr: 0.05
-  prev: 0.05
-  speed: 0.05
+  curr: 0.64
+  prev: 0.96
+  speed: 0.64
 
 # Hey! Uncomment here to input modalities!
 # ...or add your own :D
@@ -64,7 +64,7 @@ predict: null
 
 frame_encoder:
   conv_layer: true
-  kernel_size: [3, 5, 5]
+  kernel_size: [1, 5, 5] # [3, 5, 5]
   n_embd: 256
   n_embd_frames: 64
   resnet_backbone: false
@@ -84,6 +84,8 @@ resolution:
 mlp_only: false
 gru_only: false
 gru2_only: false
+
+allen: True
 
 # Rest of your parameters
 class_weights: null
